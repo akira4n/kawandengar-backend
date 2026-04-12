@@ -1,17 +1,17 @@
-version: "3.8"
-
 services:
   backend-app:
     build: .
     container_name: whisper-model-service
     restart: always
+    env_file:
+      - .env
     ports:
       - "8000:8000"
     volumes:
       - whisper_model_cache:/root/.cache/whisper
     environment:
-      - PYTHONUNBUFFERED=1
-      - ENV=production
+      PYTHONUNBUFFERED: "1"
+      ENV: production
 
 volumes:
   whisper_model_cache:
