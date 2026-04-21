@@ -8,10 +8,17 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - whisper_model_cache:/root/.cache/whisper
+      - whisper_model_cache:/root/.cache/huggingface
     environment:
       PYTHONUNBUFFERED: "1"
       ENV: production
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
 
 volumes:
   whisper_model_cache:
