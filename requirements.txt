@@ -3,6 +3,4 @@ uvicorn
 python-multipart
 faster-whisper
 python-dotenv
-torch
-torchaudio
-torchvision
+google-generativeai
