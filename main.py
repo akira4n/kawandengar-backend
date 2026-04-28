@@ -46,6 +46,9 @@ gemini_model = None
 whisper_lock = threading.Lock()
 gemini_lock = threading.Lock()
 
+gemini_api_keys = []
+current_gemini_key_idx = 0
+
 
 def _preview_text(text: str, max_chars: int = LOG_TEXT_PREVIEW_CHARS) -> str:
     compact = " ".join((text or "").split())
@@ -86,19 +89,24 @@ logger = logging.getLogger("kawandengar.api")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global whisper_model, gemini_model
+    global whisper_model, gemini_model, gemini_api_keys
 
     start_load = time.time()
     logger.info("Server startup initiated")
     logger.info("Hardware detected: %s", device.upper())
 
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key:
-        raise RuntimeError("GEMINI_API_KEY tidak ditemukan. Silakan set di environment.")
-    logger.info("Gemini API key detected: %s", "yes")
+    # Read comma-separated keys or single key
+    keys_str = os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", ""))
+    gemini_api_keys = [k.strip() for k in keys_str.split(",") if k.strip()]
+    
+    if not gemini_api_keys:
+        raise RuntimeError("GEMINI_API_KEY atau GEMINI_API_KEYS tidak ditemukan. Silakan set di environment.")
+    logger.info("Gemini API keys loaded: %d key(s)", len(gemini_api_keys))
 
     whisper_model = WhisperModel(MODEL_NAME, device=device, compute_type=compute_type)
-    genai.configure(api_key=gemini_api_key)
+    
+    # Configure with the first key initially
+    genai.configure(api_key=gemini_api_keys[0])
     gemini_model = genai.GenerativeModel(
         model_name=GEMINI_MODEL_NAME,
         system_instruction=GEMINI_SYSTEM_PROMPT,
@@ -204,9 +212,30 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
         )
 
         def run_gemini(raw_text: str) -> str:
+            global current_gemini_key_idx
             with gemini_lock:
-                response = gemini_model.generate_content(raw_text)
-            return (response.text or "").strip()
+                max_attempts = len(gemini_api_keys)
+                attempts = 0
+                while attempts < max_attempts:
+                    try:
+                        # Configure with current key
+                        genai.configure(api_key=gemini_api_keys[current_gemini_key_idx])
+                        response = gemini_model.generate_content(raw_text)
+                        return (response.text or "").strip()
+                    except Exception as e:
+                        error_msg = str(e).lower()
+                        if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
+                            logger.warning(
+                                "request_id=%s API key %d exhausted/rate-limited. Switching to next key.", 
+                                request_id, 
+                                current_gemini_key_idx
+                            )
+                            current_gemini_key_idx = (current_gemini_key_idx + 1) % len(gemini_api_keys)
+                            attempts += 1
+                            time.sleep(0.5)
+                        else:
+                            raise e
+                raise RuntimeError("Semua API key Gemini kehabisan kuota atau gagal.")
 
         try:
             logger.info("request_id=%s gemini started model=%s", request_id, GEMINI_MODEL_NAME)
