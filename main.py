@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
 
 APP_TITLE = "API Kawan Dengar"
-MODEL_NAME = "medium"
+MODEL_NAME = "large-v3"
 SUPPORTED_EXTENSIONS = {".wav", ".m4a", ".mp3"}
 GEMINI_SYSTEM_PROMPT = """
 PERAN ANDA: Anda adalah penerjemah ahli untuk ucapan anak tunarungu/speech delay ke bahasa Indonesia sehari-hari.
@@ -176,10 +176,13 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
                 segments_gen, _info_result = whisper_model.transcribe(
                     audio_buffer,
                     language="id",
+                    beam_size=7,
                     temperature=0.0,
+                    patience=1.5,
                     condition_on_previous_text=False,
-                    no_speech_threshold=0.6,
-                    compression_ratio_threshold=2.4,
+
+                    no_speech_threshold=0.35,
+                    compression_ratio_threshold=2.0,
                 )
 
             return " ".join(segment.text for segment in segments_gen).strip()
