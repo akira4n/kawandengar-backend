@@ -21,19 +21,20 @@ APP_TITLE = "API Kawan Dengar"
 MODEL_NAME = "large-v3"
 SUPPORTED_EXTENSIONS = {".wav", ".m4a", ".mp3"}
 GEMINI_SYSTEM_PROMPT = """
-PERAN ANDA: Anda adalah penerjemah ahli untuk ucapan anak tunarungu/speech delay ke bahasa Indonesia sehari-hari.
+PERAN ANDA: Anda adalah penerjemah ahli untuk ucapan anak tunarungu / speech delay berbahasa Indonesia.
 
 TUGAS UTAMA: 
-Anda akan menerima teks transkripsi dari suara anak. Tugas Anda adalah menerjemahkan kata yang cadel, terpotong, atau tidak jelas menjadi frasa yang logis.
+Ubah transkripsi mentah dari Whisper (yang sering cadel, terpotong, atau tidak jelas) menjadi kalimat bahasa Indonesia sehari-hari yang paling masuk akal.
 
 ATURAN KETAT (WAJIB DIPATUHI):
 1. JIKA INPUT SUDAH JELAS: Jika teks input sudah berupa kata/kalimat yang normal, masuk akal, dan jelas (misal: "Halo, siapa?", "Aku mau makan"), JANGAN diubah sama sekali. Keluarkan persis seperti input.
-2. JIKA INPUT BERANTAKAN/CADEL: Tebak maksudnya berdasarkan kemiripan bunyi fonetik (misal: "au aan" -> "mau makan", "ucu" -> "minum susu").
+2. JIKA INPUT BERANTAKAN/CADEL: Tebak maksudnya berdasarkan kemiripan bunyi fonetik, konteks anak, dan pola bicara anak tunarungu (misal: "au aan" -> "mau makan", "ucu" -> "minum susu").
 3. JANGAN BERBICARA: Ini bukan chatbot percakapan. Jika inputnya "Halo", output HANYA "Halo". JANGAN membalas dengan "Halo juga" atau sapaan balik.
-4. BATAS PANJANG: Maksimal 5 kata. Jika lebih, ambil inti subjek dan predikatnya saja.
+4. BATAS PANJANG: Maksimal 6 kata. Jika lebih, ambil inti subjek dan predikatnya saja.
+5. JIKA TIDAK YAKIN SAMA SEKALI: keluarkan teks asli tanpa perubahan.
 5. FORMAT FINAL: HANYA keluarkan hasil teks akhir. Dilarang memberikan tanda kutip, pengantar, penjelasan, atau basa-basi.
 """
-GEMINI_MODEL_NAME = "gemini-2.5-flash-lite"
+GEMINI_MODEL_NAME = "gemini-3.1-flash-lite-preview"
 LOG_TEXT_PREVIEW_CHARS = 80
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -95,13 +96,15 @@ async def lifespan(_: FastAPI):
     logger.info("Server startup initiated")
     logger.info("Hardware detected: %s", device.upper())
 
-    # Read comma-separated keys or single key
     keys_str = os.getenv("GEMINI_API_KEYS", os.getenv("GEMINI_API_KEY", ""))
     gemini_api_keys = [k.strip() for k in keys_str.split(",") if k.strip()]
     
     if not gemini_api_keys:
         raise RuntimeError("GEMINI_API_KEY atau GEMINI_API_KEYS tidak ditemukan. Silakan set di environment.")
     logger.info("Gemini API keys loaded: %d key(s)", len(gemini_api_keys))
+
+    current_gemini_key_idx = 0
+    logger.info("Gemini initial API key index=%d", current_gemini_key_idx)
 
     whisper_model = WhisperModel(MODEL_NAME, device=device, compute_type=compute_type)
     
@@ -218,9 +221,25 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
                 attempts = 0
                 while attempts < max_attempts:
                     try:
-                        # Configure with current key
                         genai.configure(api_key=gemini_api_keys[current_gemini_key_idx])
-                        response = gemini_model.generate_content(raw_text)
+                        logger.info(
+                            "request_id=%s using_gemini_key_index=%d",
+                            request_id,
+                            current_gemini_key_idx,
+                        )
+
+                        local_model = genai.GenerativeModel(
+                            model_name=GEMINI_MODEL_NAME,
+                            system_instruction=GEMINI_SYSTEM_PROMPT,
+                        )
+
+                        response = local_model.generate_content(
+                            raw_text,
+                            generation_config=genai.types.GenerationConfig(
+                                max_output_token=25,
+                                temperature=0.1
+                            )
+                            )
                         return (response.text or "").strip()
                     except Exception as e:
                         error_msg = str(e).lower()
@@ -238,17 +257,23 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
                 raise RuntimeError("Semua API key Gemini kehabisan kuota atau gagal.")
 
         try:
-            logger.info("request_id=%s gemini started model=%s", request_id, GEMINI_MODEL_NAME)
+            logger.info(
+                "request_id=%s gemini started model=%s gemini_key_index=%d",
+                request_id,
+                GEMINI_MODEL_NAME,
+                current_gemini_key_idx,
+            )
             gemini_started_at = time.time()
             final_text = await asyncio.to_thread(run_gemini, raw_transcript)
             gemini_duration = time.time() - gemini_started_at
         except Exception as gemini_error:
             logger.exception(
-                "request_id=%s gemini failed error_type=%s error=%s raw_length=%d",
+                "request_id=%s gemini failed error_type=%s error=%s raw_length=%d gemini_key_index=%d",
                 request_id,
                 type(gemini_error).__name__,
                 str(gemini_error),
                 len(raw_transcript),
+                current_gemini_key_idx,
             )
             raise HTTPException(status_code=502, detail="Gagal memproses hasil transkripsi dengan Gemini.") from gemini_error
 
@@ -256,11 +281,12 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
             raise HTTPException(status_code=502, detail="Gemini tidak menghasilkan output.")
 
         logger.info(
-            "request_id=%s gemini completed duration=%.2fs final_length=%d final_preview=%s",
+            "request_id=%s gemini completed duration=%.2fs final_length=%d final_preview=%s gemini_key_index=%d",
             request_id,
             gemini_duration,
             len(final_text),
             _preview_text(final_text),
+            current_gemini_key_idx,
         )
 
         processing_time = time.time() - start_process
