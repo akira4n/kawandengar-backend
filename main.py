@@ -20,6 +20,11 @@ from faster_whisper import WhisperModel
 APP_TITLE = "API Kawan Dengar"
 MODEL_NAME = "large-v3"
 SUPPORTED_EXTENSIONS = {".wav", ".m4a", ".mp3"}
+SUPPORTED_AUDIO_MIME_TYPES = {
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".mp3": "audio/mpeg",
+}
 GEMINI_SYSTEM_PROMPT = """
 PERAN ANDA: Anda adalah penerjemah ahli untuk ucapan anak tunarungu / speech delay berbahasa Indonesia.
 
@@ -57,6 +62,10 @@ def _preview_text(text: str, max_chars: int = LOG_TEXT_PREVIEW_CHARS) -> str:
         return compact
     return f"{compact[:max_chars]}..."
 
+
+def _audio_mime_type_for_extension(extension: str) -> str:
+    return SUPPORTED_AUDIO_MIME_TYPES.get(extension, "application/octet-stream")
+
 def configure_logging() -> None:
     logging.config.dictConfig(
         {
@@ -90,7 +99,7 @@ logger = logging.getLogger("kawandengar.api")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global whisper_model, gemini_model, gemini_api_keys
+    global whisper_model, gemini_model, gemini_api_keys, current_gemini_key_idx
 
     start_load = time.time()
     logger.info("Server startup initiated")
@@ -108,7 +117,6 @@ async def lifespan(_: FastAPI):
 
     whisper_model = WhisperModel(MODEL_NAME, device=device, compute_type=compute_type)
     
-    # Configure with the first key initially
     genai.configure(api_key=gemini_api_keys[0])
     gemini_model = genai.GenerativeModel(
         model_name=GEMINI_MODEL_NAME,
@@ -171,11 +179,14 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
         if not audio_bytes:
             raise HTTPException(status_code=400, detail="File audio kosong.")
 
+        audio_mime_type = _audio_mime_type_for_extension(extension)
+
         logger.info(
-            "request_id=%s audio loaded size_bytes=%d size_kb=%.2f",
+            "request_id=%s audio loaded size_bytes=%d size_kb=%.2f mime_type=%s",
             request_id,
             len(audio_bytes),
             len(audio_bytes) / 1024,
+            audio_mime_type,
         )
 
         audio_stream = io.BytesIO(audio_bytes)
@@ -214,7 +225,7 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
             _preview_text(raw_transcript),
         )
 
-        def run_gemini(raw_text: str) -> str:
+        def run_gemini(raw_text: str, audio_bytes: bytes = None, mime_type: str = "application/octet-stream") -> str:
             global current_gemini_key_idx
             with gemini_lock:
                 max_attempts = len(gemini_api_keys)
@@ -233,13 +244,33 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
                             system_instruction=GEMINI_SYSTEM_PROMPT,
                         )
 
-                        response = local_model.generate_content(
-                            raw_text,
-                            generation_config=genai.types.GenerationConfig(
-                                max_output_token=25,
-                                temperature=0.1
+                        if audio_bytes:
+                            logger.info(
+                                "request_id=%s uploading audio to gemini size_bytes=%d mime_type=%s",
+                                request_id,
+                                len(audio_bytes),
+                                mime_type,
                             )
+                            audio_file = genai.upload_file(
+                                io.BytesIO(audio_bytes),
+                                mime_type=mime_type,
+                                display_name=f"audio_{request_id}",
                             )
+                            logger.info(
+                                "request_id=%s audio uploaded to gemini file_uri=%s",
+                                request_id,
+                                audio_file.uri,
+                            )
+                            
+                            response = local_model.generate_content([
+                                "Dengarkan audio ini dan verifikasi transkripsi teks berikut (jika ada). "
+                                "Jika audio dan teks cocok, kembalikan teks yang sudah dinormalisasi. "
+                                "Jika berbeda, berikan teks yang benar dari audio:\n",
+                                audio_file,
+                                f"\nTranskripsi dari Whisper: {raw_text}"
+                            ])
+                        else:
+                            response = local_model.generate_content(raw_text)
                         return (response.text or "").strip()
                     except Exception as e:
                         error_msg = str(e).lower()
@@ -264,7 +295,7 @@ async def transcribe_audio(audio_file: UploadFile = File(...)):
                 current_gemini_key_idx,
             )
             gemini_started_at = time.time()
-            final_text = await asyncio.to_thread(run_gemini, raw_transcript)
+            final_text = await asyncio.to_thread(run_gemini, raw_transcript, audio_bytes, audio_mime_type)
             gemini_duration = time.time() - gemini_started_at
         except Exception as gemini_error:
             logger.exception(
